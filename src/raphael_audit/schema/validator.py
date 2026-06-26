@@ -6,33 +6,46 @@ import json
 from pathlib import Path
 from typing import Any
 
-from jsonschema import Draft202012Validator
+try:
+    from jsonschema import Draft202012Validator
+except ModuleNotFoundError:  # pragma: no cover
+    Draft202012Validator = None  # type: ignore[assignment]
 
-from calliope_schema.loader import load_schema
-from calliope_schema.registry.core import SchemaRegistry
+try:
+    from raphael_artifacts.calliope_schema.loader import load_schema
+    from raphael_artifacts.calliope_schema.registry.core import SchemaRegistry
+except ModuleNotFoundError:  # pragma: no cover
+    load_schema = None  # type: ignore[assignment]
+    SchemaRegistry = None  # type: ignore[assignment]
 
 def get_calliope_home() -> Path:
     return Path.home() / ".calliope"
 
-_ENVELOPE = Draft202012Validator(load_schema("event_envelope.v0.json"))
-_SNAPSHOT = Draft202012Validator(load_schema("design_snapshot.v0.json"))
-_ADDON_SCHEMAS = {
-    "fusion": Draft202012Validator(load_schema("addon_snapshot_fusion.v0.json")),
-    "solidworks": Draft202012Validator(load_schema("addon_snapshot_solidworks.v0.json")),
-    "altium": Draft202012Validator(load_schema("addon_snapshot_altium.v0.json")),
-}
+_ENVELOPE = Draft202012Validator(load_schema("event_envelope.v0.json")) if (Draft202012Validator and load_schema) else None
+_SNAPSHOT = Draft202012Validator(load_schema("design_snapshot.v0.json")) if (Draft202012Validator and load_schema) else None
+_ADDON_SCHEMAS = (
+    {
+        "fusion": Draft202012Validator(load_schema("addon_snapshot_fusion.v0.json")),
+        "solidworks": Draft202012Validator(load_schema("addon_snapshot_solidworks.v0.json")),
+        "altium": Draft202012Validator(load_schema("addon_snapshot_altium.v0.json")),
+    }
+    if (Draft202012Validator and load_schema)
+    else {}
+)
 
 # Global registry instance with persistence
-REGISTRY = SchemaRegistry(persistence_path=get_calliope_home() / "registry.json")
+REGISTRY = SchemaRegistry(persistence_path=get_calliope_home() / "registry.json") if SchemaRegistry else None
 
 
 def validate_event(event: dict[str, Any], use_registry: bool = True) -> list[str]:
     """Return validation error messages for an event envelope."""
+    if _ENVELOPE is None:
+        return []
     errors = sorted(error.message for error in _ENVELOPE.iter_errors(event))
     if errors:
         return errors
     
-    if use_registry and "wire_schema_id" in event:
+    if use_registry and REGISTRY and "wire_schema_id" in event:
         schema_id = event["wire_schema_id"]
         if schema_id == 0:
             return [] # Reserved for 'no specific wire schema' or 'legacy'
@@ -56,6 +69,8 @@ def validate_event(event: dict[str, Any], use_registry: bool = True) -> list[str
 
 def validate_design_snapshot(snapshot: dict[str, Any]) -> list[str]:
     """Return validation error messages for a design snapshot."""
+    if _SNAPSHOT is None:
+        return []
     return sorted(error.message for error in _SNAPSHOT.iter_errors(snapshot))
 
 
