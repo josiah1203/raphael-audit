@@ -2,25 +2,25 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from fastapi import APIRouter
 
-router = APIRouter(tags=["audit"])
+from raphael_audit.audit_store import AuditStore
 
-# ponytail: in-memory timeline until calliope-core event store is fully migrated
-_EVENTS: list[dict[str, Any]] = [
-    {"event_id": "e1", "event_type": "module.commit", "timestamp_utc": "2026-01-01T00:00:00Z", "summary": "Initial commit"},
-]
+router = APIRouter(tags=["audit"])
+_store = AuditStore()
 
 
 @router.get("/timeline")
-def timeline(project_id: str | None = None, limit: int = 50, cursor: str | None = None) -> dict[str, Any]:
-    events = _EVENTS[:limit]
-    return {"events": events, "next_cursor": None, "has_more": False}
+def timeline(project_id: str | None = None, limit: int = 50, cursor: str | None = None) -> dict:
+    return _store.timeline(project_id, limit, cursor)
 
 
 @router.get("/events/{event_id}")
-def get_event(event_id: str) -> dict[str, Any]:
-    ev = next((e for e in _EVENTS if e.get("event_id") == event_id), None)
+def get_event(event_id: str) -> dict:
+    ev = _store.get_event(event_id)
     return {"event": ev or {"event_id": event_id, "status": "not_found"}}
+
+
+@router.get("/verify")
+def verify() -> dict:
+    return _store.verify()
