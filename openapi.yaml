@@ -1,0 +1,12 @@
+openapi: 3.1.0
+info:
+  title: raphael-audit
+  version: 0.1.0
+  description: Activity feed, audit logs, event replay
+paths:
+  /health:
+    get:
+      summary: Health check
+      responses:
+        '200':
+          description: OK
