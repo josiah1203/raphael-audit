@@ -1,4 +1,4 @@
-"""SQLite append-only event store with deduplication."""
+"""Append-only event store with deduplication (SQLite dev, Postgres when configured)."""
 
 from __future__ import annotations
 
@@ -30,14 +30,21 @@ class EventStore:
         encrypted_at_rest: bool = False,
         data_key_path: Path | None = None,
     ) -> None:
-        self.db_path = db_path or default_db_path()
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        from raphael_contracts import db as rdb
+
+        self._postgres = rdb.is_postgres()
         self._bloom = BloomFilter()
         self._encryption = DataKeyManager(enabled=encrypted_at_rest, key_path=data_key_path)
         self._compliance = ComplianceManager()
-        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._init_schema()
+        if self._postgres:
+            rdb.ensure_migrations()
+            self.db_path = Path("postgres")
+        else:
+            self.db_path = db_path or default_db_path()
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+            self._init_schema()
         self._hydrate_bloom()
         self._hydrate_integrity_state()
 
@@ -76,37 +83,57 @@ class EventStore:
             )
             """
         )
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_micro_project ON micro_events(project_id)"
-        )
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_session_id ON session_commits(session_id)"
-        )
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_micro_project ON micro_events(project_id)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_session_id ON session_commits(session_id)")
         row = self._conn.execute("SELECT 1 FROM integrity_meta WHERE id = 1").fetchone()
         if not row:
-            self._conn.execute(
-                "INSERT INTO integrity_meta (id, last_hash, event_count) VALUES (1, NULL, 0)"
-            )
+            self._conn.execute("INSERT INTO integrity_meta (id, last_hash, event_count) VALUES (1, NULL, 0)")
         self._conn.commit()
+
+    def _fetchone(self, sql: str, params: tuple[Any, ...] = ()) -> Any | None:
+        if self._postgres:
+            from raphael_contracts.db import pg_fetchone
+
+            return pg_fetchone(sql, params)
+        return self._conn.execute(sql, params).fetchone()
+
+    def _fetchall(self, sql: str, params: tuple[Any, ...] = ()) -> list[Any]:
+        if self._postgres:
+            from raphael_contracts.db import pg_fetchall
+
+            return pg_fetchall(sql, params)
+        return self._conn.execute(sql, params).fetchall()
+
+    def _execute(self, sql: str, params: tuple[Any, ...] = ()) -> Any:
+        if self._postgres:
+            from raphael_contracts.db import pg_execute
+
+            return pg_execute(sql, params)
+        cur = self._conn.execute(sql, params)
+        self._conn.commit()
+        return cur
+
+    def _body_field(self, row: Any) -> str:
+        return row["body"] if isinstance(row, dict) else row["body"]
 
     def _hydrate_bloom(self) -> None:
         cutoff = self._cutoff_iso()
-        rows = self._conn.execute(
+        rows = self._fetchall(
             "SELECT checksum FROM micro_events WHERE received_timestamp_utc >= ?",
             (cutoff,),
         )
         for row in rows:
-            self._bloom.add(row["checksum"])
+            checksum = row["checksum"] if isinstance(row, dict) else row[0]
+            self._bloom.add(checksum)
 
     def _hydrate_integrity_state(self) -> None:
-        row = self._conn.execute(
-            "SELECT last_hash FROM integrity_meta WHERE id = 1"
-        ).fetchone()
+        row = self._fetchone("SELECT last_hash FROM integrity_meta WHERE id = 1")
         if row:
-            self._compliance.set_last_event_hash(row["last_hash"])
+            last_hash = row["last_hash"] if isinstance(row, dict) else row[0]
+            self._compliance.set_last_event_hash(last_hash)
 
     def _persist_integrity_state(self, last_hash: str) -> None:
-        self._conn.execute(
+        self._execute(
             """
             UPDATE integrity_meta
             SET last_hash = ?, event_count = event_count + 1
@@ -128,52 +155,100 @@ class EventStore:
         return json.loads(raw)
 
     def append_micro_event(self, event: dict[str, Any]) -> int | None:
-        """Insert micro-event; return rowid if accepted, None if duplicate."""
+        """Insert micro-event; return row id if accepted, None if duplicate."""
         event_id = event["event_id"]
         checksum = event["checksum"]
 
         if checksum in self._bloom:
-            existing = self._conn.execute(
+            existing = self._fetchone(
                 "SELECT 1 FROM micro_events WHERE checksum = ? LIMIT 1",
                 (checksum,),
-            ).fetchone()
+            )
             if existing:
                 return None
 
         integrity_link = self._compliance.compute_integrity_link(event)
         event["integrity_chain"] = integrity_link
 
-        try:
-            cursor = self._conn.execute(
-                """
-                INSERT INTO micro_events (
-                    event_id, checksum, project_id, event_type,
-                    timestamp_utc, received_timestamp_utc, body
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    event_id,
-                    checksum,
-                    event["project_id"],
-                    event["event_type"],
-                    event["timestamp_utc"],
-                    event["received_timestamp_utc"],
-                    self._encode_body(event),
-                ),
-            )
-            from raphael_audit.core.compliance.integrity import compute_event_hash
+        from raphael_audit.core.compliance.integrity import compute_event_hash
 
-            self._persist_integrity_state(compute_event_hash(event))
-            self._conn.commit()
-            rowid = cursor.lastrowid
+        try:
+            if self._postgres:
+                from raphael_contracts.db import adapt_sql, connection
+
+                with connection() as conn:
+                    row = conn.execute(
+                        adapt_sql(
+                            """
+                            INSERT INTO micro_events (
+                                event_id, checksum, project_id, event_type,
+                                timestamp_utc, received_timestamp_utc, body
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                            RETURNING id
+                            """
+                        ),
+                        (
+                            event_id,
+                            checksum,
+                            event["project_id"],
+                            event["event_type"],
+                            event["timestamp_utc"],
+                            event["received_timestamp_utc"],
+                            self._encode_body(event),
+                        ),
+                    ).fetchone()
+                    conn.execute(
+                        adapt_sql(
+                            """
+                            UPDATE integrity_meta
+                            SET last_hash = ?, event_count = event_count + 1
+                            WHERE id = 1
+                            """
+                        ),
+                        (compute_event_hash(event),),
+                    )
+                    conn.commit()
+                    rowid = row["id"] if row else None
+            else:
+                cursor = self._conn.execute(
+                    """
+                    INSERT INTO micro_events (
+                        event_id, checksum, project_id, event_type,
+                        timestamp_utc, received_timestamp_utc, body
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event_id,
+                        checksum,
+                        event["project_id"],
+                        event["event_type"],
+                        event["timestamp_utc"],
+                        event["received_timestamp_utc"],
+                        self._encode_body(event),
+                    ),
+                )
+                self._persist_integrity_state(compute_event_hash(event))
+                self._conn.commit()
+                rowid = cursor.lastrowid
         except sqlite3.IntegrityError:
             return None
+        except Exception as exc:
+            if self._postgres:
+                try:
+                    import psycopg.errors
+
+                    if isinstance(exc, psycopg.errors.UniqueViolation):
+                        return None
+                except ImportError:
+                    pass
+                if "unique" in str(exc).lower():
+                    return None
+            raise
 
         self._bloom.add(checksum)
         return rowid
 
     def append(self, event: dict[str, Any]) -> int | None:
-        """Legacy compatibility for append."""
         return self.append_micro_event(event)
 
     def commit_session(self, session_id: str, project_id: str, events: list[dict[str, Any]]) -> str:
@@ -181,7 +256,6 @@ class EventStore:
 
         commit_id = uuid7_str()
         timestamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
         commit_body = {
             "commit_id": commit_id,
             "session_id": session_id,
@@ -190,14 +264,12 @@ class EventStore:
             "events": events,
             "fidelity_signal": events[-1]["fidelity"] if events else None,
         }
-
         logger.info(
             "Transactionally committing %s events to Kafka via commit %s",
             len(events),
             commit_id,
         )
-
-        self._conn.execute(
+        self._execute(
             """
             INSERT INTO session_commits (commit_id, session_id, project_id, timestamp_utc, event_count, body)
             VALUES (?, ?, ?, ?, ?, ?)
@@ -211,61 +283,65 @@ class EventStore:
                 json.dumps(commit_body, separators=(",", ":"), ensure_ascii=False),
             ),
         )
-        self._conn.commit()
         return commit_id
 
     def get_event(self, event_id: str) -> dict[str, Any] | None:
-        row = self._conn.execute(
-            "SELECT body FROM micro_events WHERE event_id = ?", (event_id,)
-        ).fetchone()
+        row = self._fetchone("SELECT body FROM micro_events WHERE event_id = ?", (event_id,))
         if not row:
             return None
-        return self._decode_body(row["body"])
+        return self._decode_body(self._body_field(row))
 
     def list_events(self, project_id: str | None = None) -> list[dict[str, Any]]:
         if project_id:
-            rows = self._conn.execute(
+            rows = self._fetchall(
                 "SELECT body FROM micro_events WHERE project_id = ? ORDER BY timestamp_utc",
                 (project_id,),
             )
         else:
-            rows = self._conn.execute("SELECT body FROM micro_events ORDER BY timestamp_utc")
-        return [self._decode_body(row["body"]) for row in rows]
+            rows = self._fetchall("SELECT body FROM micro_events ORDER BY timestamp_utc")
+        return [self._decode_body(self._body_field(row)) for row in rows]
 
     def list_events_by_session(self, session_id: str) -> list[dict[str, Any]]:
-        return [
-            event
-            for event in self.list_events()
-            if event.get("session_id") == session_id
-        ]
+        return [event for event in self.list_events() if event.get("session_id") == session_id]
 
     def get_latest_rowid(self) -> int:
-        row = self._conn.execute("SELECT MAX(rowid) FROM micro_events").fetchone()
-        return row[0] if row and row[0] is not None else 0
+        if self._postgres:
+            row = self._fetchone("SELECT MAX(id) FROM micro_events")
+        else:
+            row = self._fetchone("SELECT MAX(rowid) FROM micro_events")
+        if not row:
+            return 0
+        val = row[0] if not isinstance(row, dict) else next(iter(row.values()))
+        return int(val) if val is not None else 0
 
     def get_events_range(self, start: int, end: int) -> list[dict[str, Any]]:
-        """Return events between rowid start and end (inclusive)."""
-        rows = self._conn.execute(
-            "SELECT body FROM micro_events WHERE rowid >= ? AND rowid <= ? ORDER BY rowid",
-            (start, end)
-        ).fetchall()
-        return [self._decode_body(row["body"]) for row in rows]
+        if self._postgres:
+            rows = self._fetchall(
+                "SELECT body FROM micro_events WHERE id >= ? AND id <= ? ORDER BY id",
+                (start, end),
+            )
+        else:
+            rows = self._fetchall(
+                "SELECT body FROM micro_events WHERE rowid >= ? AND rowid <= ? ORDER BY rowid",
+                (start, end),
+            )
+        return [self._decode_body(self._body_field(row)) for row in rows]
 
     def get_session_commit(self, session_id: str) -> dict[str, Any] | None:
-        row = self._conn.execute(
+        row = self._fetchone(
             "SELECT body FROM session_commits WHERE session_id = ? ORDER BY timestamp_utc DESC LIMIT 1",
             (session_id,),
-        ).fetchone()
+        )
         if not row:
             return None
-        return json.loads(row["body"])
+        return json.loads(self._body_field(row))
 
     def list_session_commits(self, session_id: str) -> list[dict[str, Any]]:
-        rows = self._conn.execute(
+        rows = self._fetchall(
             "SELECT body FROM session_commits WHERE session_id = ? ORDER BY timestamp_utc",
             (session_id,),
         )
-        return [json.loads(row["body"]) for row in rows]
+        return [json.loads(self._body_field(row)) for row in rows]
 
     def list_events_paginated(
         self,
@@ -275,7 +351,6 @@ class EventStore:
         limit: int = 50,
         since: str | None = None,
     ) -> tuple[list[dict[str, Any]], str | None]:
-        """Return page of events and next cursor (timestamp_utc)."""
         limit = max(1, min(limit, 500))
         query = "SELECT event_id, body, timestamp_utc FROM micro_events WHERE 1=1"
         params: list[Any] = []
@@ -290,18 +365,21 @@ class EventStore:
             params.append(cursor)
         query += " ORDER BY timestamp_utc ASC LIMIT ?"
         params.append(limit + 1)
-        rows = list(self._conn.execute(query, params))
+        rows = self._fetchall(query, tuple(params))
         has_extra = len(rows) > limit
         page_rows = rows[:limit]
-        events = [self._decode_body(r["body"]) for r in page_rows]
-        next_cursor = page_rows[-1]["timestamp_utc"] if has_extra and page_rows else None
+        events = [self._decode_body(self._body_field(r)) for r in page_rows]
+        if has_extra and page_rows:
+            last = page_rows[-1]
+            next_cursor = last["timestamp_utc"] if isinstance(last, dict) else last[2]
+        else:
+            next_cursor = None
         return events, next_cursor
 
     def timeline_for_document(self, document_id: str) -> list[dict[str, Any]]:
-        events = self.list_events()
         return [
             event
-            for event in events
+            for event in self.list_events()
             if event.get("payload", {}).get("document_id") == document_id
         ]
 
@@ -313,4 +391,5 @@ class EventStore:
             yield json.dumps(event, separators=(",", ":"), ensure_ascii=False)
 
     def close(self) -> None:
-        self._conn.close()
+        if not self._postgres:
+            self._conn.close()
