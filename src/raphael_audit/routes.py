@@ -19,6 +19,27 @@ router = APIRouter(tags=["audit"])
 _store = EventStore()
 
 
+def _normalize_timeline_event(event: dict[str, Any]) -> dict[str, Any]:
+    """Flatten envelope fields for Activity UI consumers."""
+    tool_obj = event.get("tool") or {}
+    tool_id = tool_obj.get("identifier") if isinstance(tool_obj, dict) else str(tool_obj or "raphael")
+    event_type = str(event.get("event_type") or event.get("type") or "event")
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    status = str(payload.get("status") or event.get("status") or "ok")
+    normalized = dict(event)
+    normalized["type"] = event_type
+    normalized["tool"] = tool_id
+    normalized["status"] = status
+    normalized["session_id"] = event.get("session_id")
+    normalized["project_id"] = event.get("project_id")
+    normalized["source"] = {
+        "tool": tool_id,
+        "event_type": event_type,
+        **(event.get("source") if isinstance(event.get("source"), dict) else {}),
+    }
+    return normalized
+
+
 @router.post("/events")
 def ingest_event(body: dict[str, Any]) -> dict[str, Any]:
     """Accept platform events, persist, and publish to Kafka."""
@@ -56,7 +77,11 @@ def ingest_event(body: dict[str, Any]) -> dict[str, Any]:
 @router.get("/timeline")
 def timeline(project_id: str | None = None, limit: int = 50, cursor: str | None = None) -> dict:
     events, next_cursor = _store.list_events_paginated(project_id=project_id, limit=limit, cursor=cursor)
-    return {"events": events, "next_cursor": next_cursor, "has_more": next_cursor is not None}
+    return {
+        "events": [_normalize_timeline_event(e) for e in events],
+        "next_cursor": next_cursor,
+        "has_more": next_cursor is not None,
+    }
 
 
 @router.get("/events/{event_id}")
